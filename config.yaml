@@ -1,0 +1,23 @@
+App:
+  Name: "Go-boilerplate"
+  Env: "local"
+DB:
+  Host: "localhost"
+  Port: "5432"
+  User: "postgres"
+  Password: "password"
+  DBName: "go-boilerplate"
+  TimeZone: "Asia/Bangkok"
+  SSL: "disable"
+  Debug: true
+  ConnectionMaxLifetimeMs: 10000
+  MaxIdleConnections: 10
+  MaxOpenConnections: 10
+
+KafkaConsumer:
+  Brokers:
+    - "localhost:9092"
+    - "localhost:9093"
+  GroupID: "go-boilerplate"
+  Topic: "go-boilerplate"
+  DeadLetterTopic: "dead-letter"
