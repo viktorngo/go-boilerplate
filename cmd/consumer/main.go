@@ -8,6 +8,8 @@ import (
 	"go-boilerplate/internal/adapter/queue/kafka"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -27,17 +29,43 @@ func main() {
 
 	// create consumer
 	demoHandler := &consumer.DemoHandler{}
-	demoConsumer, err := kafka.NewConsumer(ctx, cfg.KafkaConsumer, demoHandler.HandleKafkaMessage)
+	loyaltyHandler := &consumer.LoyaltyHandler{}
+
+	topicHandlerMap := map[string]kafka.MessageHandler{
+		cfg.KafkaConsumer.Topics.Demo:    demoHandler.HandleKafkaMessage,
+		cfg.KafkaConsumer.Topics.Loyalty: loyaltyHandler.HandleKafkaMessage,
+	}
+	kafkaConsumer, err := kafka.NewConsumer(ctx, cfg.KafkaConsumer, topicHandlerMap)
 	if err != nil {
 		slog.Error("Error creating kafka consumer", "error", err)
 		os.Exit(1)
 	}
 
-	if err := demoConsumer.StartBlocking(); err != nil {
-		slog.Error("Error starting kafka consumer", "error", err)
-		os.Exit(1)
-	}
+	// Create a channel to listen for signals
+	done := make(chan bool)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
-	slog.Info("Stop consuming message from topic = %v", demoConsumer.Topic())
+	go func() {
+		if err := kafkaConsumer.ConsumeMultipleTopics(ctx); err != nil {
+			slog.Error("Error starting kafka consumer", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for signal and then initiate shutdown
+	<-signals
+	slog.Info("Received shutdown signal")
+
+	// Stop consumer
+	kafkaConsumer.Stop()
+
+	// Signal to main routine that shutdown is complete
+	close(done)
+
+	slog.Info("Stopped consumer")
+
+	// Wait for server to finish shutting down
+	<-done
 
 }

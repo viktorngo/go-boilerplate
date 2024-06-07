@@ -17,7 +17,9 @@ DB:
 KafkaConsumer:
   Brokers:
     - "localhost:9092"
-    - "localhost:9093"
+#    - "localhost:9093"
   GroupID: "go-boilerplate"
-  Topic: "go-boilerplate"
+  Topics:
+    Demo: "demo-topic"
+    Loyalty: "loyalty-topic"
   DeadLetterTopic: "dead-letter"

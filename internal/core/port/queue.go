@@ -12,7 +12,8 @@ type Producer interface {
 type Consumer interface {
 	StartBlocking() error
 	Stop()
-	Topic() string
+	ConsumeMultipleTopics(ctx context.Context) error
+	//Topics() []string
 	Pause()
 	Resume()
 }

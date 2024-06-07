@@ -7,12 +7,11 @@ import (
 	"log/slog"
 )
 
-type DemoHandler struct {
-	//db
+type LoyaltyHandler struct {
 }
 
-func (s *DemoHandler) HandleKafkaMessage(msg kafka.Message) error {
-	slog.Info("processing message from demo", "message", string(msg.Value))
+func (s *LoyaltyHandler) HandleKafkaMessage(msg kafka.Message) error {
+	slog.Info("processing message from loyalty", "message", string(msg.Value))
 	content := make(map[string]interface{})
 	if err := json.Unmarshal(msg.Value, &content); err != nil {
 		return err

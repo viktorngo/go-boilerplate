@@ -73,8 +73,8 @@ type (
 		Brokers []string
 		GroupID string
 		Topics  struct {
-			Product  string
-			Customer string
+			Demo    string
+			Loyalty string
 		}
 		DeadLetterTopic string
 		PoolSize        int
