@@ -1,17 +1,20 @@
 package consumer
 
 import (
+	"context"
 	"errors"
+	"github.com/IBM/sarama"
 	"github.com/goccy/go-json"
-	"github.com/segmentio/kafka-go"
 	"log/slog"
+	"time"
 )
 
 type LoyaltyHandler struct {
 }
 
-func (s *LoyaltyHandler) HandleKafkaMessage(msg kafka.Message) error {
+func (s *LoyaltyHandler) HandleKafkaMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	slog.Info("processing message from loyalty", "message", string(msg.Value))
+	time.Sleep(10 * time.Second)
 	content := make(map[string]interface{})
 	if err := json.Unmarshal(msg.Value, &content); err != nil {
 		return err

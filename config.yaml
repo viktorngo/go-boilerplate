@@ -23,3 +23,19 @@ KafkaConsumer:
     Demo: "demo-topic"
     Loyalty: "loyalty-topic"
   DeadLetterTopic: "dead-letter"
+  Assignor: "sticky"
+  Verbose: false
+  Oldest: false
+
+Redis:
+  Addr: "localhost:6379"
+  Password: ""
+  DB: 0
+  PoolSize: 10
+  MinIdleConns: 10
+  DialTimeout: 5
+  ReadTimeout: 5
+  WriteTimeout: 5
+  PoolTimeout: 5
+  IdleTimeout: 5
+  IdleCheckFrequency: 5

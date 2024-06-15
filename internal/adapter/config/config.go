@@ -78,6 +78,11 @@ type (
 		}
 		DeadLetterTopic string
 		PoolSize        int
+		Verbose         bool // Sarama logging
+		KafkaVersion    string
+		Assignor        string // Consumer group partition assignment strategy (values: range, roundrobin, sticky)
+		Oldest          bool   // Kafka consumer consume initial offset from oldest
+		MessageTTL      int64  // Message TTL is the time message live on Kafka in seconds
 	}
 )
 

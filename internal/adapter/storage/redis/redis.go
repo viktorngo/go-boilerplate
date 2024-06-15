@@ -2,8 +2,10 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"github.com/redis/go-redis/v9"
 	"go-boilerplate/internal/adapter/config"
+	"go-boilerplate/internal/core/domain/custom_errors"
 	"go-boilerplate/internal/core/port"
 	"time"
 )
@@ -33,15 +35,17 @@ func New(ctx context.Context, config *config.Redis) (port.CacheRepository, error
 }
 
 // Set stores the value in the redis database
-func (r *Redis) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+func (r *Redis) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
 	return r.client.Set(ctx, key, value, ttl).Err()
 }
 
 // Get retrieves the value from the redis database
-func (r *Redis) Get(ctx context.Context, key string) ([]byte, error) {
+func (r *Redis) Get(ctx context.Context, key string) (string, error) {
 	res, err := r.client.Get(ctx, key).Result()
-	bytes := []byte(res)
-	return bytes, err
+	if errors.Is(err, redis.Nil) {
+		return "", custom_errors.NewNotfoundInCacheErr()
+	}
+	return res, err
 }
 
 // Delete removes the value from the redis database
