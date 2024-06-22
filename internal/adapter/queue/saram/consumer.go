@@ -11,7 +11,9 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,20 +27,18 @@ type Consumer struct {
 	cfg      *config.KafkaConsumer
 }
 
-func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.KafkaConsumer, cache port.CacheRepository, handlers map[string]MessageHandler) (sarama.ConsumerGroup, error) {
+func ServeConsumerGroup(ctx context.Context, cfg *config.KafkaConsumer, cache port.CacheRepository, handlers map[string]MessageHandler) error {
 	if cfg == nil {
-		return nil, errors.New("missing config")
-	}
-	if wg == nil {
-		return nil, errors.New("wait group is required")
+		return errors.New("missing config")
 	}
 	if cache == nil {
-		return nil, errors.New("cache repository is required")
+		return errors.New("cache repository is required")
 	}
 	if len(handlers) == 0 {
-		return nil, errors.New("at least one handler is required")
+		return errors.New("at least one handler is required")
 	}
 
+	keepRunning := true
 	slog.Info("Starting a new Sarama consumer")
 
 	if cfg.Verbose {
@@ -50,7 +50,7 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 	}
 	version, err := sarama.ParseKafkaVersion(cfg.KafkaVersion)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing Kafka version: %v", err)
+		return fmt.Errorf("error parsing Kafka version: %v", err)
 	}
 
 	/**
@@ -68,7 +68,7 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 	case "range":
 		saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRange()}
 	default:
-		return nil, fmt.Errorf("unrecognized consumer group partition assignor: %s", cfg.Assignor)
+		return fmt.Errorf("unrecognized consumer group partition assignor: %s", cfg.Assignor)
 	}
 
 	if cfg.Oldest {
@@ -84,9 +84,13 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 		cache:    cache,
 		cfg:      cfg,
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
 	client, err := sarama.NewConsumerGroup(cfg.Brokers, cfg.GroupID, saramaCfg)
 	if err != nil {
-		return nil, fmt.Errorf("error creating consumer group client: %w", err)
+		cancel()
+		return fmt.Errorf("error creating consumer group client: %w", err)
 	}
 
 	// collect topics to consume
@@ -95,6 +99,8 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 		topics = append(topics, topic)
 	}
 
+	consumptionIsPaused := false
+	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -107,7 +113,8 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 					slog.Info("Consumer group has been closed")
 					return
 				}
-				log.Panicf("Error from consumer: %v", err)
+				slog.Error("Error from consumer", "error", err)
+				return
 			}
 			// check if context was cancelled, signaling that the consumer should stop
 			if ctx.Err() != nil {
@@ -118,9 +125,45 @@ func NewConsumerGroup(ctx context.Context, wg *sync.WaitGroup, cfg *config.Kafka
 	}()
 
 	<-consumer.ready // Await till the consumer has been set up
-
 	slog.Info("Sarama consumer up and running!...")
-	return client, nil
+
+	sigusr1 := make(chan os.Signal, 1)
+	signal.Notify(sigusr1, syscall.SIGUSR1)
+
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
+
+	for keepRunning {
+		select {
+		case <-ctx.Done():
+			slog.Info("terminating: context cancelled")
+			keepRunning = false
+		case <-sigterm:
+			slog.Info("Received SIGTERM, shutting down")
+			keepRunning = false
+		case <-sigusr1:
+			toggleConsumptionFlow(client, &consumptionIsPaused)
+		}
+	}
+	cancel()
+	wg.Wait()
+	if err = client.Close(); err != nil {
+		return fmt.Errorf("error closing client: %v", err)
+	}
+
+	return nil
+}
+
+func toggleConsumptionFlow(client sarama.ConsumerGroup, isPaused *bool) {
+	if *isPaused {
+		client.ResumeAll()
+		log.Println("Resuming consumption")
+	} else {
+		client.PauseAll()
+		log.Println("Pausing consumption")
+	}
+
+	*isPaused = !*isPaused
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
