@@ -4,265 +4,229 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
-	"github.com/segmentio/kafka-go"
+	"github.com/IBM/sarama"
 	"go-boilerplate/internal/adapter/config"
+	"go-boilerplate/internal/core/domain/custom_errors"
 	"go-boilerplate/internal/core/port"
+	"log"
 	"log/slog"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 )
 
-type MessageHandler func(msg kafka.Message) error
+type MessageHandler func(ctx context.Context, message *sarama.ConsumerMessage) error
 
+// Consumer represents a Sarama consumer group consumer
 type Consumer struct {
-	cfg             *config.KafkaConsumer
-	messageHandler  MessageHandler
-	reader          *kafka.Reader
-	pool            *WorkerPool
-	cancelFnc       context.CancelFunc
-	deadLetter      *kafka.Writer
-	pause           bool
-	topicHandlerMap map[string]MessageHandler
+	ready    chan bool
+	handlers map[string]MessageHandler
+	cache    port.CacheRepository
+	cfg      *config.KafkaConsumer
 }
 
-func NewConsumer(ctxBg context.Context, cfg *config.KafkaConsumer, topicHandlerMap map[string]MessageHandler) (port.Consumer, error) {
-	ctx, cancel := context.WithCancel(ctxBg)
-	consumer := &Consumer{
-		cfg:             cfg,
-		topicHandlerMap: topicHandlerMap,
-		cancelFnc:       cancel,
+func ServeConsumerGroup(ctx context.Context, cfg *config.KafkaConsumer, cache port.CacheRepository, handlers map[string]MessageHandler) error {
+	if cfg == nil {
+		return errors.New("missing config")
+	}
+	if cache == nil {
+		return errors.New("cache repository is required")
+	}
+	if len(handlers) == 0 {
+		return errors.New("at least one handler is required")
 	}
 
-	if cfg.PoolSize == 0 {
-		consumer.pool = NewWorkerPool()
-	} else {
-		consumer.pool = NewWorkerPoolWithSize(cfg.PoolSize)
+	keepRunning := true
+	slog.Info("Starting a new Sarama consumer")
+
+	if cfg.Verbose {
+		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 	}
 
-	// create dead letter topic
-	if err := consumer.registerDeadLetterTopic(ctx); err != nil {
-		return nil, err
+	if cfg.KafkaVersion == "" {
+		cfg.KafkaVersion = sarama.DefaultVersion.String()
 	}
-
-	return consumer, nil
-}
-
-func (consumer *Consumer) Topics() []string {
-	topics := make([]string, 0, len(consumer.topicHandlerMap))
-	for topic := range consumer.topicHandlerMap {
-		topics = append(topics, topic)
-	}
-	return topics
-}
-
-func (consumer *Consumer) ConsumeMultipleTopics(ctx context.Context) error {
-	if len(consumer.topicHandlerMap) == 0 {
-		return errors.New("no topic handler found, required at least one topic handler")
-	}
-	// collect all topics
-	topics := make([]string, 0, len(consumer.topicHandlerMap))
-	for topic := range consumer.topicHandlerMap {
-		topics = append(topics, topic)
-	}
-
-	// create consumer group
-	group, err := kafka.NewConsumerGroup(kafka.ConsumerGroupConfig{
-		ID:      consumer.cfg.GroupID,
-		Brokers: consumer.cfg.Brokers,
-		Topics:  topics,
-	})
+	version, err := sarama.ParseKafkaVersion(cfg.KafkaVersion)
 	if err != nil {
-		fmt.Printf("error creating consumer group: %+v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error parsing Kafka version: %v", err)
 	}
-	defer group.Close()
 
-	for {
-		gen, err := group.Next(ctx)
-		if err != nil {
-			return fmt.Errorf("error getting generation: %w", err)
-		}
+	/**
+	 * Construct a new Sarama configuration.
+	 * The Kafka cluster version has to be defined before the consumer/producer is initialized.
+	 */
+	saramaCfg := sarama.NewConfig()
+	saramaCfg.Version = version
 
-		for topic, assignments := range gen.Assignments {
-			for _, assignment := range assignments {
-				partition, offset := assignment.ID, assignment.Offset
-				gen.Start(func(ctx context.Context) {
-					// create reader for this partition.
-					reader := kafka.NewReader(kafka.ReaderConfig{
-						Brokers:   consumer.cfg.Brokers,
-						Topic:     topic,
-						Partition: partition,
-					})
-					defer reader.Close()
+	switch cfg.Assignor {
+	case "sticky":
+		saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategySticky()}
+	case "roundrobin":
+		saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
+	case "range":
+		saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRange()}
+	default:
+		return fmt.Errorf("unrecognized consumer group partition assignor: %s", cfg.Assignor)
+	}
 
-					// seek to the last committed offset for this partition.
-					reader.SetOffset(offset)
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							if !consumer.pause {
-								msg, err := reader.ReadMessage(ctx)
-								if err != nil {
-									if errors.Is(err, kafka.ErrGenerationEnded) {
-										// generation has ended.  commit offsets.
-										// in a real app, offsets would be committed periodically.
-										if err := gen.CommitOffsets(map[string]map[int]int64{topic: {partition: offset + 1}}); err != nil {
-											slog.Error("error committing offsets", "error", err)
-										}
-										slog.Info("generation ended", "topic", topic, "partition", partition)
-										return
-									}
+	if cfg.Oldest {
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	}
 
-									slog.Error("error reading message", "error", err)
-									return
-								}
+	/**
+	 * Setup a new Sarama consumer group
+	 */
+	consumer := Consumer{
+		ready:    make(chan bool),
+		handlers: handlers,
+		cache:    cache,
+		cfg:      cfg,
+	}
 
-								consumer.pool.Acquire()
-								go func(ctx context.Context, msg kafka.Message) {
-									defer consumer.pool.Release()
+	ctx, cancel := context.WithCancel(ctx)
 
-									// handle message logic
-									if handler, ok := consumer.topicHandlerMap[topic]; ok {
-										if err := handler(msg); err != nil {
-											consumer.handleErrorMessage(ctx, msg, err)
-										}
-									}
-									// commit the offset
-									//if err := gen.CommitOffsets(map[string]map[int]int64{topic: {partition: offset + 1}}); err != nil {
-									//	slog.Error("error committing offsets", "error", err)
-									//}
+	client, err := sarama.NewConsumerGroup(cfg.Brokers, cfg.GroupID, saramaCfg)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("error creating consumer group client: %w", err)
+	}
 
-									// handle the message
-									if err := consumer.messageHandler(msg); err != nil {
-										if consumer.deadLetter != nil {
-											go consumer.handleErrorMessage(ctx, msg, err)
-										}
-									}
+	// collect topics to consume
+	topics := make([]string, 0, len(consumer.handlers))
+	for topic := range consumer.handlers {
+		topics = append(topics, topic)
+	}
 
-								}(ctx, msg)
-								offset = msg.Offset
-
-							}
-						}
-
-					}
-				})
+	consumptionIsPaused := false
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			// `Consume` should be called inside an infinite loop, when a
+			// server-side rebalance happens, the consumer session will need to be
+			// recreated to get the new claims
+			if err := client.Consume(ctx, topics, &consumer); err != nil {
+				if errors.Is(err, sarama.ErrClosedConsumerGroup) {
+					slog.Info("Consumer group has been closed")
+					return
+				}
+				slog.Error("Error from consumer", "error", err)
+				return
 			}
+			// check if context was cancelled, signaling that the consumer should stop
+			if ctx.Err() != nil {
+				return
+			}
+			consumer.ready = make(chan bool)
 		}
-	}
-}
+	}()
 
-// StartBlocking start kafka reader and consume the message. This is blocking method
-func (consumer *Consumer) StartBlocking() error {
-	ctx, cancelFnc := context.WithCancel(context.Background())
-	consumer.cancelFnc = cancelFnc
-	//slog.Info("Start consume message", "topic", consumer.cfg.Topic)
+	<-consumer.ready // Await till the consumer has been set up
+	slog.Info("Sarama consumer up and running!...")
 
-	kafkaConfig := kafka.ReaderConfig{
-		CommitInterval: time.Second,
-		Brokers:        consumer.cfg.Brokers,
-		GroupID:        consumer.cfg.GroupID,
-		//Topic:          consumer.cfg.Topic,
-	}
-	consumer.reader = kafka.NewReader(kafkaConfig)
+	sigusr1 := make(chan os.Signal, 1)
+	signal.Notify(sigusr1, syscall.SIGUSR1)
 
-	for {
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
+
+	for keepRunning {
 		select {
 		case <-ctx.Done():
-			return nil
-		default:
-			if !consumer.pause {
-				consumer.consume(ctx)
-			}
+			slog.Info("terminating: context cancelled")
+			keepRunning = false
+		case <-sigterm:
+			slog.Info("Received SIGTERM, shutting down")
+			keepRunning = false
+		case <-sigusr1:
+			toggleConsumptionFlow(client, &consumptionIsPaused)
 		}
 	}
-}
-
-func (consumer *Consumer) Pause() {
-	consumer.pause = true
-}
-
-func (consumer *Consumer) Resume() {
-	consumer.pause = false
-}
-
-// Stop the consumer and close dead letter
-func (consumer *Consumer) Stop() {
-	// Need to wait all message to be finished before stop otherwise it will cause panic
-	defer consumer.pool.Wait()
-
-	// run cancel function
-	if consumer.cancelFnc != nil {
-		consumer.cancelFnc()
+	cancel()
+	wg.Wait()
+	if err = client.Close(); err != nil {
+		return fmt.Errorf("error closing client: %v", err)
 	}
 
-	// send message to dead letter
-	if consumer.deadLetter == nil {
-		return
-	}
-	if err := consumer.deadLetter.Close(); err != nil {
-		slog.Error("close dead letter producer", "error", err)
-	}
-}
-
-// consume the message using worker pool and send it to message handler
-func (consumer *Consumer) consume(ctx context.Context) {
-	//! When using ReadMessage -> if GroupID is specific then it will AutoCommit Message, otherwise it only fetch and we need commit manually
-	msg, err := consumer.reader.ReadMessage(ctx)
-	if err != nil {
-		slog.Error("Kafka: cannot fetch message", "error", err)
-		return
-	}
-
-	consumer.pool.Acquire()
-	go func(ctx context.Context, msg kafka.Message) {
-		defer consumer.pool.Release()
-
-		// handle the message
-		if err := consumer.messageHandler(msg); err != nil {
-			if consumer.deadLetter != nil {
-				go consumer.handleErrorMessage(ctx, msg, err)
-			}
-		}
-
-	}(ctx, msg)
-}
-
-func (consumer *Consumer) handleErrorMessage(ctx context.Context, msg kafka.Message, processErr error) {
-	slog.Error("Kafka: handle error message", "error", processErr)
-	emsg, err := json.Marshal(ErrorMessage{
-		OriginPartition: msg.Partition,
-		Topic:           msg.Topic,
-		OriginOffset:    msg.Offset,
-		Error:           processErr.Error(),
-	})
-	if err != nil {
-		slog.Error("Kafka: can't marshal error message", "error", err)
-	}
-
-	err = consumer.deadLetter.WriteMessages(ctx, kafka.Message{
-		Key:   msg.Key,
-		Value: emsg,
-	})
-	if err != nil {
-		slog.Error("Kafka: write dead letter", "error", err)
-	}
-}
-
-func (consumer *Consumer) registerDeadLetterTopic(ctx context.Context) error {
-	if consumer.cfg.DeadLetterTopic == "" {
-		return nil
-	}
-
-	slog.Info("Register dead letter", "topic", consumer.cfg.DeadLetterTopic, "broker", consumer.cfg.Brokers)
-	consumer.deadLetter = &kafka.Writer{
-		Addr:        kafka.TCP(consumer.cfg.Brokers...),
-		Topic:       consumer.cfg.DeadLetterTopic,
-		MaxAttempts: 3,
-	}
-	slog.Info("register dead letter success", "topic", consumer.cfg.DeadLetterTopic)
 	return nil
+}
+
+func toggleConsumptionFlow(client sarama.ConsumerGroup, isPaused *bool) {
+	if *isPaused {
+		client.ResumeAll()
+		log.Println("Resuming consumption")
+	} else {
+		client.PauseAll()
+		log.Println("Pausing consumption")
+	}
+
+	*isPaused = !*isPaused
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim
+func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	// Mark the consumer as ready
+	close(consumer.ready)
+	return nil
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+// Once the Messages() channel is closed, the Handler must finish its processing
+// loop and exit.
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// NOTE:
+	// Do not move the code below to a goroutine.
+	// The `ConsumeClaim` itself is called within a goroutine, see:
+	// https://github.com/IBM/sarama/blob/main/consumer_group.go#L27-L29
+	for {
+		select {
+		case message, ok := <-claim.Messages():
+			if !ok {
+				slog.Error("message channel was closed")
+				return nil
+			}
+			slog.Info("Message claimed", "timestamp", message.Timestamp, "topic", message.Topic, "value", message.Value)
+
+			msgKey := fmt.Sprintf("%s-%d-%s", message.Topic, message.Offset, message.Key)
+			processedMsg, err := consumer.cache.Get(session.Context(), msgKey)
+			if err != nil {
+				if !errors.Is(err, &custom_errors.NotfoundInCacheErr{}) {
+					return fmt.Errorf("failed to get cache %w", err)
+				}
+			}
+			if processedMsg == "processed" {
+				continue
+			}
+
+			if handler, ok := consumer.handlers[message.Topic]; ok {
+				if err := handler(session.Context(), message); err != nil {
+					slog.Error("Error handling message", "error", err)
+					// handle failed message, push to dead letter queue, etc.
+
+					// don't mark the message as processed if push to dead letter queue is failed
+					//continue
+				}
+				// mark the message as processed in cache
+				err := consumer.cache.Set(session.Context(), msgKey, "processed", time.Duration(consumer.cfg.MessageTTL)*time.Second)
+				if err != nil {
+					return err
+				}
+				session.MarkMessage(message, "")
+			}
+
+		// Should return when `session.Context()` is done.
+		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
+		// https://github.com/IBM/sarama/issues/1192
+		case <-session.Context().Done():
+			return nil
+		}
+	}
 }

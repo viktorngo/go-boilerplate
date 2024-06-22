@@ -6,7 +6,6 @@ require (
 	github.com/goccy/go-json v0.10.3
 	github.com/redis/go-redis/v9 v9.5.2
 	github.com/samber/slog-multi v1.0.3
-	github.com/segmentio/kafka-go v0.4.47
 	github.com/spf13/viper v1.19.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gorm.io/driver/postgres v1.5.7

@@ -6,7 +6,7 @@ import (
 	"go-boilerplate/internal/adapter/config"
 	"go-boilerplate/internal/adapter/handler/consumer"
 	"go-boilerplate/internal/adapter/logger"
-	"go-boilerplate/internal/adapter/queue/saram"
+	"go-boilerplate/internal/adapter/queue/kafka"
 	"go-boilerplate/internal/adapter/storage/redis"
 	"log/slog"
 	"os"
@@ -38,12 +38,12 @@ func main() {
 	loyaltyHandler := consumer.LoyaltyHandler{}
 
 	// run kafka client
-	handlers := map[string]saram.MessageHandler{
+	handlers := map[string]kafka.MessageHandler{
 		cfg.KafkaConsumer.Topics.Demo:    demoHandler.HandleKafkaMessage,
 		cfg.KafkaConsumer.Topics.Loyalty: loyaltyHandler.HandleKafkaMessage,
 	}
 
-	if err := saram.ServeConsumerGroup(ctx, cfg.KafkaConsumer, cache, handlers); err != nil {
+	if err := kafka.ServeConsumerGroup(ctx, cfg.KafkaConsumer, cache, handlers); err != nil {
 		slog.Error("Error creating consumer group", "error", err)
 		return
 	}
